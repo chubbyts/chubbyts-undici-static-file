@@ -24,15 +24,15 @@ A minimal static file handler for chubbyts-undici-server.
 ## Requirements
 
  * node: 20
- * [@chubbyts/chubbyts-http-error][2]: ^3.0.1
- * [@chubbyts/chubbyts-undici-server][3]: ^1.0.1
+ * [@chubbyts/chubbyts-http-error][2]: ^3.1.3
+ * [@chubbyts/chubbyts-undici-server][3]: ^1.0.3
 
 ## Installation
 
 Through [NPM](https://www.npmjs.com) as [@chubbyts/chubbyts-undici-static-file][1].
 
 ```ts
-npm i @chubbyts/chubbyts-undici-static-file@^1.0.0
+npm i @chubbyts/chubbyts-undici-static-file@^1.0.1
 ```
 
 ## Usage
