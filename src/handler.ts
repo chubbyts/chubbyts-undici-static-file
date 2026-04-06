@@ -1,4 +1,5 @@
 import { createHash, getHashes } from 'node:crypto';
+import type { Stats } from 'node:fs';
 import { accessSync, constants, createReadStream, statSync } from 'node:fs';
 import { extname } from 'node:path';
 import { STATUS_CODES } from 'node:http';
@@ -18,17 +19,17 @@ const assertHashAlgorithm = (hashAlgorithm: string): void => {
   }
 };
 
-const access = (filepath: string): boolean => {
+const getStats = (filepath: string): Stats | undefined => {
   try {
     accessSync(filepath, constants.R_OK);
 
-    return true;
+    return statSync(filepath);
   } catch {
-    return false;
+    return undefined;
   }
 };
 
-const checksum = async (filepath: string, hashAlgorithm: string): Promise<string> => {
+const calculateHash = async (filepath: string, hashAlgorithm: string): Promise<string> => {
   return new Promise((resolve: (hash: string) => void) => {
     const hash = createHash(hashAlgorithm);
     const stream = createReadStream(filepath);
@@ -50,15 +51,15 @@ export const createStaticFileHandler = (
 ): Handler => {
   assertHashAlgorithm(hashAlgorithm);
 
-  const createResponse = (body: BodyInit, code: number, filename: string, hash: string): Response => {
-    const extension = extname(filename).slice(1);
+  const createResponse = (body: BodyInit, code: number, filepath: string, hash: string, stats: Stats): Response => {
+    const extension = extname(filepath).slice(1);
     const mimeType = mimeTypes.get(extension);
 
     return new Response(body, {
       status: code,
       statusText: STATUS_CODES[code],
       headers: {
-        'content-length': String(statSync(filename).size),
+        'content-length': stats.size.toString(),
         etag: hash,
         ...(mimeType ? { 'content-type': mimeType } : {}),
       },
@@ -70,11 +71,13 @@ export const createStaticFileHandler = (
 
     const filepath = publicDirectory + url.pathname;
 
-    if (!access(filepath) || statSync(filepath).isDirectory()) {
+    const stats = getStats(filepath);
+
+    if (!stats || stats.isDirectory()) {
       throw createNotFound({ detail: `There is no file at path "${url.pathname}"` });
     }
 
-    const hash = await checksum(filepath, hashAlgorithm);
+    const hash = await calculateHash(filepath, hashAlgorithm);
 
     if (
       serverRequest.headers
@@ -83,9 +86,9 @@ export const createStaticFileHandler = (
         ?.map((headerPart) => headerPart.trim())
         ?.includes(hash)
     ) {
-      return createResponse(null, 304, filepath, hash);
+      return createResponse(null, 304, filepath, hash, stats);
     }
 
-    return createResponse(createReadStream(filepath), 200, filepath, hash);
+    return createResponse(createReadStream(filepath), 200, filepath, hash, stats);
   };
 };

@@ -75,7 +75,15 @@ describe('handler', () => {
       throw new Error('Missing error');
     } catch (e) {
       expect(e).toBeInstanceOf(HttpError);
-      expect(e).toMatchInlineSnapshot('[Error: Not Found]');
+      expect({ ...(e as HttpError) }).toMatchInlineSnapshot(`
+        {
+          "_httpError": "NotFound",
+          "detail": "There is no file at path "/test.jpg"",
+          "status": 404,
+          "title": "Not Found",
+          "type": "https://datatracker.ietf.org/doc/html/rfc2616#section-10.4.5",
+        }
+      `);
     }
 
     rmSync(publicDirectory, { recursive: true });
@@ -98,7 +106,15 @@ describe('handler', () => {
       throw new Error('Missing error');
     } catch (e) {
       expect(e).toBeInstanceOf(HttpError);
-      expect(e).toMatchInlineSnapshot('[Error: Not Found]');
+      expect({ ...(e as HttpError) }).toMatchInlineSnapshot(`
+        {
+          "_httpError": "NotFound",
+          "detail": "There is no file at path "/test.jpg"",
+          "status": 404,
+          "title": "Not Found",
+          "type": "https://datatracker.ietf.org/doc/html/rfc2616#section-10.4.5",
+        }
+      `);
     }
 
     rmSync(publicDirectory, { recursive: true });
@@ -170,6 +186,35 @@ describe('handler', () => {
     rmSync(publicDirectory, { recursive: true });
   });
 
+  test('with existing file and unknown mime type', async () => {
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+    const path = '/test.unknown';
+    const filepath = publicDirectory + path;
+
+    mkdirSync(publicDirectory, { recursive: true });
+
+    writeFileSync(filepath, 'test');
+
+    const serverRequest = new ServerRequest(`https://example.com${path}`);
+
+    const handler = createStaticFileHandler(publicDirectory, (await import('../src/mimetypes')).default);
+
+    const response = await handler(serverRequest);
+
+    expect(response.status).toBe(200);
+    expect(response.statusText).toBe('OK');
+    expect(Object.fromEntries([...response.headers.entries()])).toMatchInlineSnapshot(`
+      {
+        "content-length": "4",
+        "etag": "098f6bcd4621d373cade4e832627b4f6",
+      }
+    `);
+    expect(response.body).not.toBeNull();
+    expect(await response.text()).toBe('test');
+
+    rmSync(publicDirectory, { recursive: true });
+  });
+
   test('with unknown file', async () => {
     const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
 
@@ -184,7 +229,7 @@ describe('handler', () => {
       throw new Error('expect fail');
     } catch (e) {
       expect(e).toBeInstanceOf(HttpError);
-      expect({ ...e }).toMatchInlineSnapshot(`
+      expect({ ...(e as HttpError) }).toMatchInlineSnapshot(`
         {
           "_httpError": "NotFound",
           "detail": "There is no file at path "/test.unknown"",
