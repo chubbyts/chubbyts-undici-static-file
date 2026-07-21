@@ -48,7 +48,13 @@ const resolveFile = async (
 
     const fileHandle = await open(filepath, 'r');
 
-    return { filepath, fileHandle, size: (await fileHandle.stat()).size };
+    try {
+      return { filepath, fileHandle, size: (await fileHandle.stat()).size };
+    } catch (e) {
+      await fileHandle.close();
+
+      throw e;
+    }
   } catch {
     throw createFileNotFound();
   }
@@ -95,7 +101,7 @@ export const createStaticFileHandler = (
     size: number,
   ): Response => {
     const extension = extname(filepath).slice(1);
-    const mimeType = mimeTypes.get(extension);
+    const mimeType = mimeTypes.get(extension) ?? 'application/octet-stream';
 
     return new Response(body, {
       status: code,
@@ -103,7 +109,8 @@ export const createStaticFileHandler = (
       headers: {
         'content-length': size.toString(),
         etag,
-        ...(mimeType ? { 'content-type': mimeType } : {}),
+        'content-type': mimeType,
+        'x-content-type-options': 'nosniff',
       },
     });
   };

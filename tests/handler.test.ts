@@ -2,10 +2,15 @@ import { tmpdir } from 'os';
 import { randomBytes } from 'crypto';
 import { chmodSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { execFileSync } from 'child_process';
-import { describe, expect, test } from 'vitest';
+import * as fsPromises from 'node:fs/promises';
+import { describe, expect, test, vi } from 'vitest';
 import { HttpError } from '@chubbyts/chubbyts-http-error/dist/http-error';
 import { ServerRequest } from '@chubbyts/chubbyts-undici-server/dist/server';
 import { createStaticFileHandler } from '../src/handler';
+
+vi.mock('node:fs/promises', async (importOriginal) => ({
+  ...(await importOriginal<typeof fsPromises>()),
+}));
 
 const jpegHex = `
 ffd8ffe000104a46494600010101012c012c0000fffe0013437265617465
@@ -236,6 +241,61 @@ describe('handler', () => {
     rmSync(publicDirectory, { recursive: true });
   });
 
+  test('with file deleted between open and stat', async () => {
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+    const path = '/test.txt';
+    const filepath = publicDirectory + path;
+
+    mkdirSync(publicDirectory, { recursive: true });
+
+    writeFileSync(filepath, 'test');
+
+    const onClose = vi.fn();
+
+    const realOpen = fsPromises.open;
+
+    const openSpy = vi.spyOn(fsPromises, 'open').mockImplementationOnce(async (...args) => {
+      const fileHandle = await realOpen(...(args as Parameters<typeof realOpen>));
+
+      return new Proxy(fileHandle, {
+        get: (target, property) => {
+          if ('stat' === property) {
+            return async () => {
+              throw new Error('stat failed');
+            };
+          }
+
+          if ('close' === property) {
+            return async () => {
+              onClose();
+
+              return target.close();
+            };
+          }
+
+          return Reflect.get(target, property, target);
+        },
+      });
+    });
+
+    const serverRequest = new ServerRequest(`https://example.com${path}`);
+
+    const handler = createStaticFileHandler(publicDirectory, new Map());
+
+    try {
+      await handler(serverRequest);
+      throw new Error('Missing error');
+    } catch (e) {
+      expect(e).toBeInstanceOf(HttpError);
+      expect((e as HttpError).status).toBe(404);
+    }
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    openSpy.mockRestore();
+    rmSync(publicDirectory, { recursive: true });
+  });
+
   test.runIf(existsSync('/proc/self/mem'))('with readable but unhashable file', async () => {
     const serverRequest = new ServerRequest('https://example.com/mem');
 
@@ -297,6 +357,7 @@ describe('handler', () => {
       'content-length': '1229',
       'content-type': 'image/jpeg',
       etag: jpegEtag,
+      'x-content-type-options': 'nosniff',
     });
     expect(response.body).toBeNull();
 
@@ -326,6 +387,7 @@ describe('handler', () => {
       'content-length': '1229',
       'content-type': 'image/jpeg',
       etag: jpegEtag,
+      'x-content-type-options': 'nosniff',
     });
     expect(response.body).not.toBeNull();
 
@@ -399,6 +461,7 @@ describe('handler', () => {
       'content-length': '1229',
       'content-type': 'image/jpeg',
       etag: jpegEtag,
+      'x-content-type-options': 'nosniff',
     });
     expect(response.body).toBeNull();
 
@@ -478,7 +541,9 @@ describe('handler', () => {
     expect(response.statusText).toBe('OK');
     expect(Object.fromEntries([...response.headers.entries()])).toEqual({
       'content-length': '4',
+      'content-type': 'application/octet-stream',
       etag: '"098f6bcd4621d373cade4e832627b4f6"',
+      'x-content-type-options': 'nosniff',
     });
     expect(response.body).not.toBeNull();
     expect(await response.text()).toBe('test');
