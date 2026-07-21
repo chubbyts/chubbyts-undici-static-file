@@ -1,6 +1,7 @@
 import { tmpdir } from 'os';
 import { randomBytes } from 'crypto';
-import { mkdirSync, rmSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { execFileSync } from 'child_process';
 import { describe, expect, test } from 'vitest';
 import { HttpError } from '@chubbyts/chubbyts-http-error/dist/http-error';
 import { ServerRequest } from '@chubbyts/chubbyts-undici-server/dist/server';
@@ -50,6 +51,8 @@ ffc40014100100000000000000000000000000000000ffda000801010001
 00000000000000000000000000000000ffda0008010100013f107fffd9
 `.replace(/\s+/g, '');
 
+const jpegEtag = '"0f1653b9b75fff62db7c49628e23a304"';
+
 describe('handler', () => {
   test('with not supported algorithm', async () => {
     try {
@@ -89,6 +92,42 @@ describe('handler', () => {
     rmSync(publicDirectory, { recursive: true });
   });
 
+  test('with missing public directory', async () => {
+    const serverRequest = new ServerRequest('https://example.com/test.jpg');
+
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+
+    const handler = createStaticFileHandler(publicDirectory, new Map());
+
+    try {
+      await handler(serverRequest);
+      throw new Error('Missing error');
+    } catch (e) {
+      expect(e).toBeInstanceOf(HttpError);
+      expect((e as HttpError).status).toBe(404);
+    }
+  });
+
+  test('with file as public directory', async () => {
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+
+    writeFileSync(publicDirectory, 'test');
+
+    const serverRequest = new ServerRequest('https://example.com/test.jpg');
+
+    const handler = createStaticFileHandler(publicDirectory, new Map());
+
+    try {
+      await handler(serverRequest);
+      throw new Error('Missing error');
+    } catch (e) {
+      expect(e).toBeInstanceOf(HttpError);
+      expect((e as HttpError).status).toBe(404);
+    }
+
+    rmSync(publicDirectory);
+  });
+
   test('with directory', async () => {
     const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
     const path = '/test.jpg';
@@ -120,6 +159,150 @@ describe('handler', () => {
     rmSync(publicDirectory, { recursive: true });
   });
 
+  test('with symlink pointing outside the public directory', async () => {
+    const baseDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+    const publicDirectory = `${baseDirectory}/public`;
+    const privateDirectory = `${baseDirectory}/public-private`;
+    const path = '/secret.txt';
+
+    mkdirSync(publicDirectory, { recursive: true });
+    mkdirSync(privateDirectory, { recursive: true });
+
+    writeFileSync(privateDirectory + path, 'must not be served');
+    symlinkSync(privateDirectory + path, publicDirectory + path);
+
+    const serverRequest = new ServerRequest(`https://example.com${path}`);
+
+    const handler = createStaticFileHandler(publicDirectory, new Map());
+
+    try {
+      await handler(serverRequest);
+      throw new Error('Missing error');
+    } catch (e) {
+      expect(e).toBeInstanceOf(HttpError);
+      expect((e as HttpError).status).toBe(404);
+    }
+
+    rmSync(baseDirectory, { recursive: true });
+  });
+
+  test.runIf(process.platform === 'linux')('with fifo', async () => {
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+    const path = '/test.fifo';
+    const filepath = publicDirectory + path;
+
+    mkdirSync(publicDirectory, { recursive: true });
+
+    execFileSync('mkfifo', [filepath]);
+
+    const serverRequest = new ServerRequest(`https://example.com${path}`);
+
+    const handler = createStaticFileHandler(publicDirectory, new Map());
+
+    try {
+      await handler(serverRequest);
+      throw new Error('Missing error');
+    } catch (e) {
+      expect(e).toBeInstanceOf(HttpError);
+      expect((e as HttpError).status).toBe(404);
+    }
+
+    rmSync(publicDirectory, { recursive: true });
+  });
+
+  test.runIf(process.platform !== 'win32' && process.getuid?.() !== 0)('with unreadable file', async () => {
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+    const path = '/test.txt';
+    const filepath = publicDirectory + path;
+
+    mkdirSync(publicDirectory, { recursive: true });
+
+    writeFileSync(filepath, 'test');
+    chmodSync(filepath, 0o000);
+
+    const serverRequest = new ServerRequest(`https://example.com${path}`);
+
+    const handler = createStaticFileHandler(publicDirectory, new Map());
+
+    try {
+      await handler(serverRequest);
+      throw new Error('Missing error');
+    } catch (e) {
+      expect(e).toBeInstanceOf(HttpError);
+      expect((e as HttpError).status).toBe(404);
+    }
+
+    chmodSync(filepath, 0o644);
+    rmSync(publicDirectory, { recursive: true });
+  });
+
+  test.runIf(existsSync('/proc/self/mem'))('with readable but unhashable file', async () => {
+    const serverRequest = new ServerRequest('https://example.com/mem');
+
+    const handler = createStaticFileHandler('/proc/self', new Map());
+
+    try {
+      await handler(serverRequest);
+      throw new Error('Missing error');
+    } catch (e) {
+      expect(e).toBeInstanceOf(HttpError);
+      expect((e as HttpError).status).toBe(404);
+    }
+  });
+
+  test.each([['POST'], ['PUT'], ['PATCH'], ['DELETE'], ['OPTIONS']])('with not allowed method %s', async (method) => {
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+    const path = '/test.txt';
+
+    mkdirSync(publicDirectory, { recursive: true });
+
+    writeFileSync(publicDirectory + path, 'test');
+
+    const serverRequest = new ServerRequest(`https://example.com${path}`, { method });
+
+    const handler = createStaticFileHandler(publicDirectory, new Map());
+
+    try {
+      await handler(serverRequest);
+      throw new Error('Missing error');
+    } catch (e) {
+      expect(e).toBeInstanceOf(HttpError);
+      expect((e as HttpError).status).toBe(405);
+      expect((e as HttpError).detail).toBe(`Method "${method}" is not allowed, allowed are "GET", "HEAD"`);
+    }
+
+    rmSync(publicDirectory, { recursive: true });
+  });
+
+  test('with head request', async () => {
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+    const path = '/test.jpg';
+    const filepath = publicDirectory + path;
+
+    const data = Buffer.from(jpegHex, 'hex');
+
+    mkdirSync(publicDirectory, { recursive: true });
+
+    writeFileSync(filepath, data);
+
+    const serverRequest = new ServerRequest(`https://example.com${path}`, { method: 'HEAD' });
+
+    const handler = createStaticFileHandler(publicDirectory, (await import('../src/mimetypes')).default);
+
+    const response = await handler(serverRequest);
+
+    expect(response.status).toBe(200);
+    expect(response.statusText).toBe('OK');
+    expect(Object.fromEntries([...response.headers.entries()])).toEqual({
+      'content-length': '1229',
+      'content-type': 'image/jpeg',
+      etag: jpegEtag,
+    });
+    expect(response.body).toBeNull();
+
+    rmSync(publicDirectory, { recursive: true });
+  });
+
   test('with image', async () => {
     const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
     const path = '/test.jpg';
@@ -139,18 +322,56 @@ describe('handler', () => {
 
     expect(response.status).toBe(200);
     expect(response.statusText).toBe('OK');
-    expect(Object.fromEntries([...response.headers.entries()])).toMatchInlineSnapshot(`
-      {
-        "content-length": "1229",
-        "content-type": "image/jpeg",
-        "etag": "0f1653b9b75fff62db7c49628e23a304",
-      }
-    `);
+    expect(Object.fromEntries([...response.headers.entries()])).toEqual({
+      'content-length': '1229',
+      'content-type': 'image/jpeg',
+      etag: jpegEtag,
+    });
     expect(response.body).not.toBeNull();
 
     expect(Buffer.from(await response.arrayBuffer()).toString('hex')).toBe(jpegHex);
 
     rmSync(publicDirectory, { recursive: true });
+  });
+
+  test('with image and query string', async () => {
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+    const path = '/test.jpg';
+    const filepath = publicDirectory + path;
+
+    const data = Buffer.from(jpegHex, 'hex');
+
+    mkdirSync(publicDirectory, { recursive: true });
+
+    writeFileSync(filepath, data);
+
+    const serverRequest = new ServerRequest(`https://example.com${path}?version=1`);
+
+    const handler = createStaticFileHandler(publicDirectory, (await import('../src/mimetypes')).default);
+
+    const response = await handler(serverRequest);
+
+    expect(response.status).toBe(200);
+    expect(Buffer.from(await response.arrayBuffer()).toString('hex')).toBe(jpegHex);
+
+    rmSync(publicDirectory, { recursive: true });
+  });
+
+  test.runIf(process.platform !== 'win32')('with filesystem root as public directory', async () => {
+    const filepath = `${tmpdir()}/${randomBytes(16).toString('hex')}.txt`;
+
+    writeFileSync(filepath, 'test');
+
+    const serverRequest = new ServerRequest(`https://example.com${filepath}`);
+
+    const handler = createStaticFileHandler('/', new Map());
+
+    const response = await handler(serverRequest);
+
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('test');
+
+    rmSync(filepath);
   });
 
   test('with image and matching etag', async () => {
@@ -165,7 +386,7 @@ describe('handler', () => {
     writeFileSync(filepath, data);
 
     const serverRequest = new ServerRequest(`https://example.com${path}`, {
-      headers: { 'if-none-match': '0f1653b9b75fff62db7c49628e23a304' },
+      headers: { 'if-none-match': jpegEtag },
     });
 
     const handler = createStaticFileHandler(publicDirectory, (await import('../src/mimetypes')).default);
@@ -174,14 +395,66 @@ describe('handler', () => {
 
     expect(response.status).toBe(304);
     expect(response.statusText).toBe('Not Modified');
-    expect(Object.fromEntries([...response.headers.entries()])).toMatchInlineSnapshot(`
-      {
-        "content-length": "1229",
-        "content-type": "image/jpeg",
-        "etag": "0f1653b9b75fff62db7c49628e23a304",
-      }
-    `);
+    expect(Object.fromEntries([...response.headers.entries()])).toEqual({
+      'content-length': '1229',
+      'content-type': 'image/jpeg',
+      etag: jpegEtag,
+    });
     expect(response.body).toBeNull();
+
+    rmSync(publicDirectory, { recursive: true });
+  });
+
+  test.each([
+    ['wildcard', '*'],
+    ['weak', `W/${jpegEtag}`],
+    ['list', `"other", W/${jpegEtag}`],
+  ])('with image and matching etag via %s', async (_, ifNoneMatch) => {
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+    const path = '/test.jpg';
+    const filepath = publicDirectory + path;
+
+    const data = Buffer.from(jpegHex, 'hex');
+
+    mkdirSync(publicDirectory, { recursive: true });
+
+    writeFileSync(filepath, data);
+
+    const serverRequest = new ServerRequest(`https://example.com${path}`, {
+      headers: { 'if-none-match': ifNoneMatch },
+    });
+
+    const handler = createStaticFileHandler(publicDirectory, (await import('../src/mimetypes')).default);
+
+    const response = await handler(serverRequest);
+
+    expect(response.status).toBe(304);
+    expect(response.body).toBeNull();
+
+    rmSync(publicDirectory, { recursive: true });
+  });
+
+  test('with image and not matching etag', async () => {
+    const publicDirectory = `${tmpdir()}/${randomBytes(16).toString('hex')}`;
+    const path = '/test.jpg';
+    const filepath = publicDirectory + path;
+
+    const data = Buffer.from(jpegHex, 'hex');
+
+    mkdirSync(publicDirectory, { recursive: true });
+
+    writeFileSync(filepath, data);
+
+    const serverRequest = new ServerRequest(`https://example.com${path}`, {
+      headers: { 'if-none-match': '"other", W/"another"' },
+    });
+
+    const handler = createStaticFileHandler(publicDirectory, (await import('../src/mimetypes')).default);
+
+    const response = await handler(serverRequest);
+
+    expect(response.status).toBe(200);
+    expect(Buffer.from(await response.arrayBuffer()).toString('hex')).toBe(jpegHex);
 
     rmSync(publicDirectory, { recursive: true });
   });
@@ -203,12 +476,10 @@ describe('handler', () => {
 
     expect(response.status).toBe(200);
     expect(response.statusText).toBe('OK');
-    expect(Object.fromEntries([...response.headers.entries()])).toMatchInlineSnapshot(`
-      {
-        "content-length": "4",
-        "etag": "098f6bcd4621d373cade4e832627b4f6",
-      }
-    `);
+    expect(Object.fromEntries([...response.headers.entries()])).toEqual({
+      'content-length': '4',
+      etag: '"098f6bcd4621d373cade4e832627b4f6"',
+    });
     expect(response.body).not.toBeNull();
     expect(await response.text()).toBe('test');
 

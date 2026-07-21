@@ -1,13 +1,20 @@
 import { createHash, getHashes } from 'node:crypto';
-import type { Stats } from 'node:fs';
-import { accessSync, constants, createReadStream, statSync } from 'node:fs';
-import { extname } from 'node:path';
+import type { FileHandle } from 'node:fs/promises';
+import { open, realpath, stat } from 'node:fs/promises';
+import { extname, sep } from 'node:path';
 import { STATUS_CODES } from 'node:http';
-import { createNotFound } from '@chubbyts/chubbyts-http-error/dist/http-error';
+import type { HttpError } from '@chubbyts/chubbyts-http-error/dist/http-error';
+import { createMethodNotAllowed, createNotFound } from '@chubbyts/chubbyts-http-error/dist/http-error';
 import type { BodyInit, Handler, ServerRequest } from '@chubbyts/chubbyts-undici-server/dist/server';
 import { Response } from '@chubbyts/chubbyts-undici-server/dist/server';
 
 export type MimeTypes = Map<string, string>;
+
+type ResolvedFile = {
+  filepath: string;
+  fileHandle: FileHandle;
+  size: number;
+};
 
 const assertHashAlgorithm = (hashAlgorithm: string): void => {
   const supportedHashAlgorithms = getHashes();
@@ -19,28 +26,57 @@ const assertHashAlgorithm = (hashAlgorithm: string): void => {
   }
 };
 
-const getStats = (filepath: string): Stats | undefined => {
+const resolveFile = async (
+  publicDirectory: string,
+  pathname: string,
+  createFileNotFound: () => HttpError,
+): Promise<ResolvedFile> => {
   try {
-    accessSync(filepath, constants.R_OK);
+    const resolvedPublicDirectory = await realpath(publicDirectory);
+    const filepath = await realpath(resolvedPublicDirectory + pathname);
 
-    return statSync(filepath);
+    const prefix = resolvedPublicDirectory.endsWith(sep) ? resolvedPublicDirectory : resolvedPublicDirectory + sep;
+
+    if (!filepath.startsWith(prefix)) {
+      throw createFileNotFound();
+    }
+
+    // stat before open: open would block on a fifo until a writer connects
+    if (!(await stat(filepath)).isFile()) {
+      throw createFileNotFound();
+    }
+
+    const fileHandle = await open(filepath, 'r');
+
+    return { filepath, fileHandle, size: (await fileHandle.stat()).size };
   } catch {
-    return undefined;
+    throw createFileNotFound();
   }
 };
 
-const calculateHash = async (filepath: string, hashAlgorithm: string): Promise<string> => {
-  return new Promise((resolve: (hash: string) => void) => {
-    const hash = createHash(hashAlgorithm);
-    const stream = createReadStream(filepath);
+const calculateHash = async (fileHandle: FileHandle, hashAlgorithm: string): Promise<string> => {
+  const hash = createHash(hashAlgorithm);
 
-    stream.on('data', (data) => {
-      hash.update(data);
-    });
+  for await (const data of fileHandle.createReadStream({ start: 0, autoClose: false })) {
+    hash.update(data as Buffer);
+  }
 
-    stream.on('end', () => {
-      resolve(hash.digest('hex'));
-    });
+  return hash.digest('hex');
+};
+
+const matchesIfNoneMatch = (ifNoneMatch: string | null, etag: string): boolean => {
+  if (null === ifNoneMatch) {
+    return false;
+  }
+
+  return ifNoneMatch.split(',').some((part) => {
+    const candidate = part.trim();
+
+    if ('*' === candidate) {
+      return true;
+    }
+
+    return (candidate.startsWith('W/') ? candidate.slice(2) : candidate) === etag;
   });
 };
 
@@ -51,7 +87,13 @@ export const createStaticFileHandler = (
 ): Handler => {
   assertHashAlgorithm(hashAlgorithm);
 
-  const createResponse = (body: BodyInit, code: number, filepath: string, hash: string, stats: Stats): Response => {
+  const createResponse = (
+    body: BodyInit | null,
+    code: number,
+    filepath: string,
+    etag: string,
+    size: number,
+  ): Response => {
     const extension = extname(filepath).slice(1);
     const mimeType = mimeTypes.get(extension);
 
@@ -59,36 +101,46 @@ export const createStaticFileHandler = (
       status: code,
       statusText: STATUS_CODES[code],
       headers: {
-        'content-length': stats.size.toString(),
-        etag: hash,
+        'content-length': size.toString(),
+        etag,
         ...(mimeType ? { 'content-type': mimeType } : {}),
       },
     });
   };
 
   return async (serverRequest: ServerRequest): Promise<Response> => {
+    const { method } = serverRequest;
+
+    if ('GET' !== method && 'HEAD' !== method) {
+      throw createMethodNotAllowed({ detail: `Method "${method}" is not allowed, allowed are "GET", "HEAD"` });
+    }
+
     const url = new URL(serverRequest.url);
 
-    const filepath = publicDirectory + url.pathname;
+    const createFileNotFound = () => createNotFound({ detail: `There is no file at path "${url.pathname}"` });
 
-    const stats = getStats(filepath);
+    const { filepath, fileHandle, size } = await resolveFile(publicDirectory, url.pathname, createFileNotFound);
 
-    if (!stats || stats.isDirectory()) {
-      throw createNotFound({ detail: `There is no file at path "${url.pathname}"` });
+    const hash = await calculateHash(fileHandle, hashAlgorithm).catch(async () => {
+      await fileHandle.close();
+
+      throw createFileNotFound();
+    });
+
+    const etag = `"${hash}"`;
+
+    if (matchesIfNoneMatch(serverRequest.headers.get('if-none-match'), etag)) {
+      await fileHandle.close();
+
+      return createResponse(null, 304, filepath, etag, size);
     }
 
-    const hash = await calculateHash(filepath, hashAlgorithm);
+    if ('HEAD' === method) {
+      await fileHandle.close();
 
-    if (
-      serverRequest.headers
-        .get('if-none-match')
-        ?.split(',')
-        ?.map((headerPart) => headerPart.trim())
-        ?.includes(hash)
-    ) {
-      return createResponse(null, 304, filepath, hash, stats);
+      return createResponse(null, 200, filepath, etag, size);
     }
 
-    return createResponse(createReadStream(filepath), 200, filepath, hash, stats);
+    return createResponse(fileHandle.createReadStream(), 200, filepath, etag, size);
   };
 };
